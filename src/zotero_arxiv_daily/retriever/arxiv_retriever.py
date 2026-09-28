@@ -12,12 +12,17 @@ from queue import Empty
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+import time
 
 T = TypeVar("T")
 
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+ARXIV_USER_AGENT = (
+    "zotero-arxiv-daily/1.0 "
+    "(https://github.com/Wonder0225/zotero-arxiv-daily-personal; +https://arxiv.org/help/robots)"
+)
 
 
 def _download_file(url: str, path: str) -> None:
@@ -105,6 +110,67 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
+def _retrieve_arxiv_batch_with_retry(
+    paper_ids: list[str],
+    max_retries: int = 3,
+    initial_delay: float = 2.0,
+) -> list[ArxivResult]:
+    """
+    Retrieve a batch of arXiv papers with exponential backoff retry logic.
+    
+    Args:
+        paper_ids: List of arXiv paper IDs to retrieve
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+    
+    Returns:
+        List of successfully retrieved papers (may be partial on partial failure)
+    """
+    client = arxiv.Client(
+        num_retries=3,
+        delay_seconds=3,
+    )
+    
+    for attempt in range(max_retries):
+        try:
+            search = arxiv.Search(id_list=paper_ids)
+            results = list(client.results(search))
+            if results:
+                logger.info(f"Successfully retrieved {len(results)}/{len(paper_ids)} papers from batch")
+            return results
+        except arxiv.HTTPError as e:
+            if attempt == max_retries - 1:
+                logger.warning(
+                    f"Failed to retrieve batch after {max_retries} attempts. "
+                    f"HTTP {e.code}: {paper_ids[:3]}... "
+                    f"(Proceeding with empty batch)"
+                )
+                return []
+            
+            wait_time = initial_delay * (2 ** attempt)
+            logger.warning(
+                f"HTTP {e.code} retrieving batch (attempt {attempt + 1}/{max_retries}). "
+                f"Retrying in {wait_time:.1f}s... {paper_ids[:3]}..."
+            )
+            time.sleep(wait_time)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.warning(
+                    f"Error retrieving batch: {type(e).__name__}: {e}. "
+                    f"Proceeding with empty batch."
+                )
+                return []
+            
+            wait_time = initial_delay * (2 ** attempt)
+            logger.warning(
+                f"Error retrieving batch: {type(e).__name__}. "
+                f"Retrying in {wait_time:.1f}s..."
+            )
+            time.sleep(wait_time)
+    
+    return []
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -113,13 +179,14 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+        
         # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+        
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
         all_paper_ids = [
@@ -127,18 +194,34 @@ class ArxivRetriever(BaseRetriever):
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
+        
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        # Get full information of each paper from arxiv api
+        logger.info(f"Fetching {len(all_paper_ids)} arXiv papers in batches of 10")
+        
+        # Retrieve papers in smaller batches with retry logic
+        batch_size = 10
         bar = tqdm(total=len(all_paper_ids))
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            batch = list(client.results(search))
-            bar.update(len(batch))
-            raw_papers.extend(batch)
+        
+        for i in range(0, len(all_paper_ids), batch_size):
+            batch_ids = all_paper_ids[i:i + batch_size]
+            batch_papers = _retrieve_arxiv_batch_with_retry(batch_ids, max_retries=3, initial_delay=2.0)
+            
+            raw_papers.extend(batch_papers)
+            bar.update(len(batch_ids))
+            
+            # Be respectful to arXiv API: delay between batches
+            if i + batch_size < len(all_paper_ids):
+                time.sleep(2)
+        
         bar.close()
-
+        
+        if not raw_papers:
+            logger.warning("No papers were successfully retrieved from arXiv")
+        else:
+            logger.info(f"Successfully retrieved {len(raw_papers)}/{len(all_paper_ids)} papers total")
+        
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
