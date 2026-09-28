@@ -126,10 +126,7 @@ def _retrieve_arxiv_batch_with_retry(
     Returns:
         List of successfully retrieved papers (may be partial on partial failure)
     """
-    client = arxiv.Client(
-        num_retries=3,
-        delay_seconds=3,
-    )
+    client = arxiv.Client(num_retries=3)
     
     for attempt in range(max_retries):
         try:
